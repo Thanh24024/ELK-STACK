@@ -1,110 +1,182 @@
 #!/usr/bin/env python3
-import requests
-import json
+import os
 import time
-import warnings
+import json
+import requests
 from datetime import datetime, timedelta
-from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import ElasticsearchWarning
-
-# Tắt cảnh báo bảo mật nếu không dùng
-warnings.filterwarnings("ignore", category=ElasticsearchWarning)
 
 # Cấu hình Telegram
-TELEGRAM_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
-CHAT_ID = "5898979798"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+TELEGRAM_BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
+TELEGRAM_CHAT_ID = "5898979798"
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+# File log chính (interface up/down)
+LOG_FILE = "/var/log/logstash/telegram_debug.log"
+OFFSET_FILE = "/home/elk/telegram_debug.offset"
 
 # Cấu hình Elasticsearch
-ES_HOST = "http://192.168.240.130:9200"
-ES_INDEX = "cisco-metrics-*"
-ES = Elasticsearch([ES_HOST])  # Thêm auth nếu cần
+ES_URL = "http://192.168.240.130:9200"
+ES_INDEX = "cisco-metrics-*"  # index có thể tùy chỉnh
+ES_QUERY_INTERVAL_SECONDS = 60  # query dữ liệu 60 giây gần nhất
 
-# Ngưỡng cảnh báo
-THRESHOLDS = {
-    "cpu": 5,         # % CPU
-    "memory": 5,      # % RAM
-    "temp": 6,        # °C
-    "status_change": True
-}
+# Lưu thời điểm lần cuối lấy dữ liệu Elasticsearch
+last_es_query_time = None
 
-interface_status_cache = {}
+def get_offset(offset_path, log_path):
+    if os.path.exists(offset_path):
+        try:
+            with open(offset_path, "r") as f:
+                return int(f.read().strip())
+        except:
+            return 0
+    else:
+        if os.path.exists(log_path):
+            size = os.path.getsize(log_path)
+            save_offset(offset_path, size)
+            return size
+        else:
+            return 0
 
-def send_telegram_alert(message):
+def save_offset(offset_path, offset):
+    try:
+        with open(offset_path, "w") as f:
+            f.write(str(offset))
+    except Exception as e:
+        print("Lỗi khi lưu offset:", e)
+
+def send_telegram_message(text):
     payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
         "parse_mode": "HTML"
     }
     try:
-        response = requests.post(TELEGRAM_API_URL, json=payload)
-        response.raise_for_status()
-        print(f"Đã gửi cảnh báo: {message}")
+        response = requests.post(TELEGRAM_URL, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("✅ Tin nhắn đã được gửi thành công!")
+            return True
+        else:
+            print("❌ Lỗi gửi tin nhắn:", response.status_code, response.text)
+            return False
     except Exception as e:
-        print(f"Lỗi khi gửi Telegram: {e}")
+        print("❌ Lỗi exception khi gửi:", e)
+        return False
 
-def check_alerts():
-    time_range = {"gte": "now-15s", "lte": "now"}
-    
-    try:
-        response = ES.search(
-            index=ES_INDEX,
-            query={
-                "bool": {
-                    "must": [
-                        {"range": {"@timestamp": time_range}},
-                        {"exists": {"field": "metric_type"}}
-                    ]
+def handle_main_event(event):
+    timestamp = event.get("@timestamp", "No timestamp")
+    description = event.get("description", "No description provided")
+    if isinstance(description, list):
+        description = "\n".join(description)
+
+    message_text = (
+        "<b>📢 Network Event Alert</b>\n"
+        f"<b>Timestamp:</b> {timestamp} UTC\n"
+        f"<b>Description:</b> {description}\n\n"
+        "<a href='http://192.168.74.129:5601'>🔍 Check Kibana</a>"
+    )
+    send_telegram_message(message_text)
+
+def query_elasticsearch_alerts():
+    global last_es_query_time
+
+    # Lấy thời gian hiện tại UTC
+    now = datetime.utcnow()
+
+    # Nếu chưa có lần query trước, lấy dữ liệu 5 phút trước
+    if last_es_query_time is None:
+        last_es_query_time = now - timedelta(minutes=5)
+
+    # Khoảng thời gian query
+    start_time = last_es_query_time.isoformat() + "Z"
+    end_time = now.isoformat() + "Z"
+
+    last_es_query_time = now  # Cập nhật thời gian query mới
+
+    # Query Elasticsearch DSL để lấy các tài liệu có timestamp trong khoảng này
+    query = {
+        "query": {
+            "range": {
+                "@timestamp": {
+                    "gte": start_time,
+                    "lt": end_time
                 }
-            },
-            size=100,
-            sort=[{"@timestamp": "desc"}]
-        )
-        
-        hits = response.get('hits', {}).get('hits', [])
-        
-        for hit in hits:
-            source = hit.get('_source', {})
-            metric_type = source.get('metric_type')
-            device_ip = source.get('device_ip', 'Unknown')
-            device_name = source.get('device_name', device_ip)
-            
-            if metric_type == "cpu":
-                cpu = source.get('cpu_5m_percent')
-                if cpu and cpu > THRESHOLDS['cpu']:
-                    message = f"⚠️ <b>CPU CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nCPU 5 phút: <b>{cpu}%</b>\nThời điểm: {source.get('@timestamp')}"
-                    send_telegram_alert(message)
-            
-            elif metric_type == "memory":
-                mem = source.get('memory_used_percent')
-                if mem and mem > THRESHOLDS['memory']:
-                    message = f"⚠️ <b>RAM CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nRAM sử dụng: <b>{mem}%</b>\nTổng RAM: {source.get('memory_total_mb', 'N/A')} MB\nThời điểm: {source.get('@timestamp')}"
-                    send_telegram_alert(message)
-            
-            elif metric_type == "temperature":
-                temp = source.get('temp_celsius')
-                if temp and temp > THRESHOLDS['temp']:
-                    message = f"⚠️ <b>NHIỆT ĐỘ CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nNhiệt độ: <b>{temp}°C</b>\nThời điểm: {source.get('@timestamp')}"
-                    send_telegram_alert(message)
-            
-            elif metric_type == "bandwidth" and THRESHOLDS['status_change']:
-                interface = source.get('interface_name')
-                current_status = source.get('interface_status_name')
-                interface_key = f"{device_ip}_{interface}"
-                
-                if interface_key in interface_status_cache:
-                    previous_status = interface_status_cache[interface_key]
-                    if previous_status != current_status:
-                        message = f"🔄 <b>THAY ĐỔI TRẠNG THÁI CỔNG</b> 🔄\nThiết bị: {device_name} ({device_ip})\nCổng: <b>{interface}</b>\nTrạng thái: {previous_status} → <b>{current_status}</b>\nThời điểm: {source.get('@timestamp')}"
-                        send_telegram_alert(message)
-                
-                interface_status_cache[interface_key] = current_status
-    
+            }
+        },
+        "size": 100,
+        "sort": [{"@timestamp": {"order": "asc"}}]
+    }
+
+    try:
+        url = f"{ES_URL}/{ES_INDEX}/_search"
+        headers = {"Content-Type": "application/json"}
+        resp = requests.get(url, headers=headers, json=query, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        print(f"Lỗi khi query Elasticsearch: {e}")
+        print("❌ Lỗi khi truy vấn Elasticsearch:", e)
+        return []
+
+    hits = data.get("hits", {}).get("hits", [])
+    alerts = []
+    for hit in hits:
+        source = hit.get("_source", {})
+        alerts.append(source)
+    return alerts
+
+def process_log_file(log_path, offset_path, handler):
+    if not os.path.exists(log_path):
+        print(f"⛔ File {log_path} không tồn tại.")
+        return
+
+    current_offset = get_offset(offset_path, log_path)
+
+    with open(log_path, "r") as f:
+        f.seek(current_offset)
+        new_lines = f.readlines()
+        new_offset = f.tell()
+
+    if not new_lines:
+        return
+
+    for line in new_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            print("⚠️ Không thể parse dòng:", line)
+            continue
+
+        handler(event)
+        time.sleep(1)
+
+    save_offset(offset_path, new_offset)
+    print(f"✔ Đã cập nhật offset: {new_offset}")
+
+def process_elasticsearch_alerts():
+    alerts = query_elasticsearch_alerts()
+    if not alerts:
+        print("Không có cảnh báo mới từ Elasticsearch.")
+        return
+
+    for alert in alerts:
+        # Bạn có thể tùy chỉnh phần này để chọn các field muốn gửi trong tin nhắn
+        timestamp = alert.get("@timestamp", "No timestamp")
+        metric = alert.get("metric_type", "Unknown metric")
+        device_ip = alert.get("device_ip", "Unknown device")
+        value = alert.get("value", "N/A")
+
+        message_text = (
+            f"<b>⚠️ Alert from Elasticsearch</b>\n"
+            f"<b>Timestamp:</b> {timestamp}\n"
+            f"<b>Device IP:</b> {device_ip}\n"
+            f"<b>Metric:</b> {metric}\n"
+            f"<b>Value:</b> {value}\n"
+            "<a href='http://192.168.240.130:5601'>🔍 Check Kibana</a>"
+        )
+        send_telegram_message(message_text)
+        time.sleep(1)
 
 if __name__ == "__main__":
-    print("Bắt đầu giám sát cảnh báo...")
     while True:
-        check_alerts()
-        time.sleep(15)
+        process_log_file(LOG_FILE, OFFSET_FILE, handle_main_event)
+        process_elasticsearch_alerts()
+        time.sleep(30)
