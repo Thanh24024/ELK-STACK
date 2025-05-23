@@ -3,7 +3,9 @@ import os
 import time
 import json
 import requests
+from datetime import datetime, timezone
 from datetime import datetime, timedelta
+
 
 # Cấu hình Telegram
 TELEGRAM_BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
@@ -16,7 +18,7 @@ OFFSET_FILE = "/home/elk/telegram_debug.offset"
 
 # Cấu hình Elasticsearch
 ES_URL = "http://192.168.240.130:9200"
-ES_INDEX = "cisco-metrics-*"  # index có thể tùy chỉnh
+ES_INDEX = "cisco-metrics-*"  
 ES_QUERY_INTERVAL_SECONDS = 60  # query dữ liệu 60 giây gần nhất
 
 # Lưu thời điểm lần cuối lấy dữ liệu Elasticsearch
@@ -72,7 +74,7 @@ def handle_main_event(event):
         "<b>📢 Network Event Alert</b>\n"
         f"<b>Timestamp:</b> {timestamp} UTC\n"
         f"<b>Description:</b> {description}\n\n"
-        "<a href='http://192.168.74.129:5601'>🔍 Check Kibana</a>"
+        "<a href='http://192.168.240.130:5601'>🔍 Check Kibana</a>"
     )
     send_telegram_message(message_text)
 
@@ -80,7 +82,7 @@ def query_elasticsearch_alerts():
     global last_es_query_time
 
     # Lấy thời gian hiện tại UTC
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # Nếu chưa có lần query trước, lấy dữ liệu 5 phút trước
     if last_es_query_time is None:
@@ -158,22 +160,26 @@ def process_elasticsearch_alerts():
         return
 
     for alert in alerts:
-        # Bạn có thể tùy chỉnh phần này để chọn các field muốn gửi trong tin nhắn
         timestamp = alert.get("@timestamp", "No timestamp")
         metric = alert.get("metric_type", "Unknown metric")
         device_ip = alert.get("device_ip", "Unknown device")
+        device_model = alert.get("device_model", "Unknown model")
+        metric_type = alert.get("metric_type", "Unknown metric")
         value = alert.get("value", "N/A")
+
+      
 
         message_text = (
             f"<b>⚠️ Alert from Elasticsearch</b>\n"
             f"<b>Timestamp:</b> {timestamp}\n"
             f"<b>Device IP:</b> {device_ip}\n"
-            f"<b>Metric:</b> {metric}\n"
-            f"<b>Value:</b> {value}\n"
+            f"<b>Device_name:</b> {device_model}\n"
+            f"<b>Metric:</b> {metric_type}\n"
             "<a href='http://192.168.240.130:5601'>🔍 Check Kibana</a>"
         )
         send_telegram_message(message_text)
         time.sleep(1)
+
 
 if __name__ == "__main__":
     while True:
