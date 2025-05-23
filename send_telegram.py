@@ -1,254 +1,110 @@
 #!/usr/bin/env python3
 import requests
-import time
 import json
-import requests
+import time
+import warnings
+from datetime import datetime, timedelta
+from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import ElasticsearchWarning
 
-# Thông tin bot Telegram và chat_id
-BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
+# Tắt cảnh báo bảo mật nếu không dùng
+warnings.filterwarnings("ignore", category=ElasticsearchWarning)
+
+# Cấu hình Telegram
+TELEGRAM_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
 CHAT_ID = "5898979798"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-ELK_URL = "http://192.168.240.130:9200/cisco-metrics-*/_search"
+# Cấu hình Elasticsearch
+ES_HOST = "http://192.168.240.130:9200"
+ES_INDEX = "cisco-metrics-*"
+ES = Elasticsearch([ES_HOST])  # Thêm auth nếu cần
 
-# Header JSON cho Elasticsearch
-HEADERS = {
-    "Content-Type": "application/json"
+# Ngưỡng cảnh báo
+THRESHOLDS = {
+    "cpu": 5,         # % CPU
+    "memory": 5,      # % RAM
+    "temp": 6,        # °C
+    "status_change": True
 }
 
-# Lưu cảnh báo đã gửi lần trước để tránh spam
-last_alert_message = ""
+interface_status_cache = {}
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def send_telegram_alert(message):
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
     try:
-        resp = requests.post(url, json=payload)
-        if resp.status_code != 200:
-            print(f"Failed to send message: {resp.text}")
+        response = requests.post(TELEGRAM_API_URL, json=payload)
+        response.raise_for_status()
+        print(f"Đã gửi cảnh báo: {message}")
     except Exception as e:
-        print(f"Exception sending telegram message: {e}")
+        print(f"Lỗi khi gửi Telegram: {e}")
 
-def query_elk(query):
+def check_alerts():
+    time_range = {"gte": "now-15s", "lte": "now"}
+    
     try:
-        resp = requests.post(ELK_URL, headers=HEADERS, json=query)
-        resp.raise_for_status()
-        return resp.json()
+        response = ES.search(
+            index=ES_INDEX,
+            query={
+                "bool": {
+                    "must": [
+                        {"range": {"@timestamp": time_range}},
+                        {"exists": {"field": "metric_type"}}
+                    ]
+                }
+            },
+            size=100,
+            sort=[{"@timestamp": "desc"}]
+        )
+        
+        hits = response.get('hits', {}).get('hits', [])
+        
+        for hit in hits:
+            source = hit.get('_source', {})
+            metric_type = source.get('metric_type')
+            device_ip = source.get('device_ip', 'Unknown')
+            device_name = source.get('device_name', device_ip)
+            
+            if metric_type == "cpu":
+                cpu = source.get('cpu_5m_percent')
+                if cpu and cpu > THRESHOLDS['cpu']:
+                    message = f"⚠️ <b>CPU CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nCPU 5 phút: <b>{cpu}%</b>\nThời điểm: {source.get('@timestamp')}"
+                    send_telegram_alert(message)
+            
+            elif metric_type == "memory":
+                mem = source.get('memory_used_percent')
+                if mem and mem > THRESHOLDS['memory']:
+                    message = f"⚠️ <b>RAM CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nRAM sử dụng: <b>{mem}%</b>\nTổng RAM: {source.get('memory_total_mb', 'N/A')} MB\nThời điểm: {source.get('@timestamp')}"
+                    send_telegram_alert(message)
+            
+            elif metric_type == "temperature":
+                temp = source.get('temp_celsius')
+                if temp and temp > THRESHOLDS['temp']:
+                    message = f"⚠️ <b>NHIỆT ĐỘ CAO</b> ⚠️\nThiết bị: {device_name} ({device_ip})\nNhiệt độ: <b>{temp}°C</b>\nThời điểm: {source.get('@timestamp')}"
+                    send_telegram_alert(message)
+            
+            elif metric_type == "bandwidth" and THRESHOLDS['status_change']:
+                interface = source.get('interface_name')
+                current_status = source.get('interface_status_name')
+                interface_key = f"{device_ip}_{interface}"
+                
+                if interface_key in interface_status_cache:
+                    previous_status = interface_status_cache[interface_key]
+                    if previous_status != current_status:
+                        message = f"🔄 <b>THAY ĐỔI TRẠNG THÁI CỔNG</b> 🔄\nThiết bị: {device_name} ({device_ip})\nCổng: <b>{interface}</b>\nTrạng thái: {previous_status} → <b>{current_status}</b>\nThời điểm: {source.get('@timestamp')}"
+                        send_telegram_alert(message)
+                
+                interface_status_cache[interface_key] = current_status
+    
     except Exception as e:
-        print(f"Error querying ELK: {e}")
-        return None
-
-def check_interface_status():
-    query = {
-        "size": 100,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"metric_type": "bandwidth"}},
-                    {
-                        "terms": {
-                            "interface_status_name": ["down", "up"]
-                        }
-                    }
-                ],
-                "filter": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1m"
-                        }
-                    }
-                }
-            }
-        },
-        "sort": [{"@timestamp": {"order": "desc"}}]
-    }
-    data = query_elk(query)
-    alerts = []
-    if data and "hits" in data and "hits" in data["hits"]:
-        for hit in data["hits"]["hits"]:
-            source = hit["_source"]
-            status = source.get("interface_status_name", "")
-            iface = source.get("interface_name", "unknown")
-            device = source.get("device_name", source.get("device_ip", "unknown"))
-            if status in ["down", "up"]:
-                alerts.append(f"⚠️ Interface *{iface}* on device *{device}* is *{status.upper()}*")
-    return alerts
-
-def check_cpu():
-    query = {
-        "size": 100,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"metric_type": "cpu"}},
-                    {
-                        "range": {
-                            "cpu_5m_percent": {
-                                "gte": 1
-                            }
-                        }
-                    }
-                ],
-                "filter": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1m"
-                        }
-                    }
-                }
-            }
-        },
-        "sort": [{"@timestamp": {"order": "desc"}}]
-    }
-    data = query_elk(query)
-    alerts = []
-    if data and "hits" in data and "hits" in data["hits"]:
-        for hit in data["hits"]["hits"]:
-            src = hit["_source"]
-            device = src.get("device_name", src.get("device_ip", "unknown"))
-            cpu = src.get("cpu_5m_percent", 0)
-            alerts.append(f"🔥 CPU high on *{device}*: {cpu}% (5 min avg)")
-    return alerts
-
-def check_ram():
-    query = {
-        "size": 100,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"metric_type": "memory"}},
-                    {
-                        "range": {
-                            "memory_used_percent": {
-                                "gte": 1
-                            }
-                        }
-                    }
-                ],
-                "filter": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1m"
-                        }
-                    }
-                }
-            }
-        },
-        "sort": [{"@timestamp": {"order": "desc"}}]
-    }
-    data = query_elk(query)
-    alerts = []
-    if data and "hits" in data and "hits" in data["hits"]:
-        for hit in data["hits"]["hits"]:
-            src = hit["_source"]
-            device = src.get("device_name", src.get("device_ip", "unknown"))
-            ram = src.get("memory_used_percent", 0)
-            alerts.append(f"🧠 RAM usage high on *{device}*: {ram}%")
-    return alerts
-
-def check_temperature():
-    query = {
-        "size": 100,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"metric_type": "temperature"}},
-                    {
-                        "range": {
-                            "temp_celsius": {
-                                "gte": 1
-                            }
-                        }
-                    }
-                ],
-                "filter": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1m"
-                        }
-                    }
-                }
-            }
-        },
-        "sort": [{"@timestamp": {"order": "desc"}}]
-    }
-    data = query_elk(query)
-    alerts = []
-    if data and "hits" in data and "hits" in data["hits"]:
-        for hit in data["hits"]["hits"]:
-            src = hit["_source"]
-            device = src.get("device_name", src.get("device_ip", "unknown"))
-            temp = src.get("temp_celsius", 0)
-            alerts.append(f"🌡️ Temperature high on *{device}*: {temp} °C")
-    return alerts
-
-def check_bandwidth():
-    query = {
-        "size": 100,
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"metric_type": "bandwidth"}},
-                    {
-                        "range": {
-                            "bits_in": {
-                                "gte": 100  # > 1 Gbps
-                            }
-                        }
-                    }
-                ],
-                "filter": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": "now-1m"
-                        }
-                    }
-                }
-            }
-        },
-        "sort": [{"@timestamp": {"order": "desc"}}]
-    }
-    data = query_elk(query)
-    alerts = []
-    if data and "hits" in data and "hits" in data["hits"]:
-        for hit in data["hits"]["hits"]:
-            src = hit["_source"]
-            device = src.get("device_name", src.get("device_ip", "unknown"))
-            iface = src.get("interface_name", "unknown")
-            bits_in = src.get("bits_in", 0)
-            bits_out = src.get("bits_out", 0)
-            alerts.append(f"📶 Bandwidth high on *{device}* interface *{iface}*: In={bits_in}bps Out={bits_out}bps")
-    return alerts
-
-def main_loop():
-    global last_alert_message
-    while True:
-        try:
-            alerts = []
-            alerts.extend(check_interface_status())
-            alerts.extend(check_cpu())
-            alerts.extend(check_ram())
-            alerts.extend(check_temperature())
-            alerts.extend(check_bandwidth())
-
-            if alerts:
-                message = "\n\n".join(alerts)
-                # So sánh với tin nhắn trước, nếu khác mới gửi
-                if message != last_alert_message:
-                    send_telegram_message(message)
-                    last_alert_message = message
-                else:
-                    print("Alert unchanged, not sending again.")
-            else:
-                print("No alerts at this time.")
-                last_alert_message = ""
-        except Exception as e:
-            print(f"Error in main loop: {e}")
-
-        time.sleep(30)
+        print(f"Lỗi khi query Elasticsearch: {e}")
 
 if __name__ == "__main__":
-    main_loop()
+    print("Bắt đầu giám sát cảnh báo...")
+    while True:
+        check_alerts()
+        time.sleep(15)
