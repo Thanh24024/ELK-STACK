@@ -1,107 +1,82 @@
 #!/usr/bin/env python3
-import os
+import requests
 import time
 import json
 import requests
 
-# Cấu hình Telegram mới
-TELEGRAM_BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
-TELEGRAM_CHAT_ID = "5898979798"
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-# File log theo dõi
-LOG_FILE = "/var/log/logstash/telegram_debug.log"
-OFFSET_FILE = "/home/elk/telegram_debug.offset"
+BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
+CHAT_ID = "5898979798"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-def get_offset(offset_path, log_path):
-    if os.path.exists(offset_path):
-        try:
-            with open(offset_path, "r") as f:
-                return int(f.read().strip())
-        except:
-            return 0
-    else:
-        if os.path.exists(log_path):
-            size = os.path.getsize(log_path)
-            save_offset(offset_path, size)
-            return size
-        else:
-            return 0
-
-def save_offset(offset_path, offset):
-    try:
-        with open(offset_path, "w") as f:
-            f.write(str(offset))
-    except Exception as e:
-        print("Lỗi khi lưu offset:", e)
-
-def send_telegram_message(text):
+def send_telegram_message(message: str):
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
     }
     try:
-        response = requests.post(TELEGRAM_URL, json=payload, timeout=10)
+        response = requests.post(TELEGRAM_API_URL, data=payload)
         if response.status_code == 200:
-            print("✅ Tin nhắn đã được gửi thành công!")
-            return True
+            print("Đã gửi cảnh báo Telegram thành công!")
         else:
-            print("❌ Lỗi gửi tin nhắn:", response.status_code, response.text)
-            return False
+            print(f"Lỗi khi gửi tin nhắn Telegram: {response.text}")
     except Exception as e:
-        print("❌ Lỗi exception khi gửi:", e)
-        return False
+        print(f"Exception khi gửi Telegram: {e}")
 
-def handle_event(event):
-    timestamp = event.get("@timestamp", "No timestamp")
-    description = event.get("description", "No description")
-    alert_type = event.get("alert_type", "Unknown")  # Kiểu cảnh báo: "cpu", "ram", "port", etc.
-    severity = event.get("severity", "info")         # Mức độ cảnh báo
+def alert_port_status(device_name, interface_name, status):
+    message = (f"⚠️ *Cảnh báo cổng mạng*\n"
+               f"Thiết bị: *{device_name}*\n"
+               f"Cổng: `{interface_name}` vừa *{status}*.")
+    send_telegram_message(message)
 
-    if isinstance(description, list):
-        description = "\n".join(description)
+def alert_cpu_usage(device_name, cpu_percent, threshold=10.0):
+    if cpu_percent >= threshold:
+        message = (f"🔥 *Cảnh báo CPU cao*\n"
+                   f"Thiết bị: *{device_name}*\n"
+                   f"CPU sử dụng: *{cpu_percent}%* (ngưỡng: {threshold}%)")
+        send_telegram_message(message)
 
-    message_text = (
-        "<b>🚨 CẢNH BÁO HỆ THỐNG</b>\n"
-        f"<b>Loại:</b> {alert_type.upper()}\n"
-        f"<b>Mức độ:</b> {severity}\n"
-        f"<b>Thời gian:</b> {timestamp} UTC\n"
-        f"<b>Chi tiết:</b> {description}\n\n"
-        "<a href='http://192.168.240.130:5601'>🔍 Xem trên Kibana</a>"
-    )
+def alert_memory_usage(device_name, memory_percent, threshold=10.0):
+    if memory_percent >= threshold:
+        message = (f"🔥 *Cảnh báo RAM cao*\n"
+                   f"Thiết bị: *{device_name}*\n"
+                   f"RAM sử dụng: *{memory_percent}%* (ngưỡng: {threshold}%)")
+        send_telegram_message(message)
 
-    send_telegram_message(message_text)
+def alert_temperature(device_name, temp_celsius, threshold=10.0):
+    if temp_celsius >= threshold:
+        message = (f"🌡️ *Cảnh báo nhiệt độ cao*\n"
+                   f"Thiết bị: *{device_name}*\n"
+                   f"Nhiệt độ: *{temp_celsius}°C* (ngưỡng: {threshold}°C)")
+        send_telegram_message(message)
 
-def process_log_file(log_path, offset_path, handler):
-    if not os.path.exists(log_path):
-        print(f"⛔ File {log_path} không tồn tại.")
-        return
+def alert_bandwidth(device_name, interface_name, bits_in, bits_out, threshold_bits=10.0):
+    # threshold_bits ~ 800Mbps
+    if bits_in >= threshold_bits or bits_out >= threshold_bits:
+        message = (f"📶 *Cảnh báo băng thông cao*\n"
+                   f"Thiết bị: *{device_name}*\n"
+                   f"Cổng: `{interface_name}`\n"
+                   f"Lưu lượng vào: *{bits_in/1_000_000:.2f} Mbps*\n"
+                   f"Lưu lượng ra: *{bits_out/1_000_000:.2f} Mbps*\n"
+                   f"Ngưỡng: {threshold_bits/1_000_000} Mbps")
+        send_telegram_message(message)
 
-    current_offset = get_offset(offset_path, log_path)
 
-    with open(log_path, "r") as f:
-        f.seek(current_offset)
-        new_lines = f.readlines()
-        new_offset = f.tell()
 
-    if not new_lines:
-        return
-
-    for line in new_lines:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            print("⚠️ Không thể parse dòng:", line)
-            continue
-
-        handler(event)
-        time.sleep(1)
-
-    save_offset(offset_path, new_offset)
-    print(f"✔ Đã cập nhật offset: {new_offset}")
-
+# Ví dụ giả lập gọi hàm (thay thế bằng dữ liệu thực tế khi tích hợp)
 if __name__ == "__main__":
-    while True:
-        process_log_file(LOG_FILE, OFFSET_FILE, handle_event)
-        time.sleep(30)
+    # Ví dụ cổng vừa xuống (down)
+    alert_port_status("Switch L3-1", "GigabitEthernet0/1", "xuống")
+
+    # CPU vượt ngưỡng
+    alert_cpu_usage("Cisco C7200", 90.5)
+
+    # RAM vượt ngưỡng
+    alert_memory_usage("Switch L3-2", 85.3)
+
+    # Nhiệt độ vượt ngưỡng
+    alert_temperature("Cisco C7200", 75)
+
+    # Băng thông cao
+    alert_bandwidth("Switch L3-1", "GigabitEthernet0/2", 850_000_000, 400_000_000)
