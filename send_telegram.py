@@ -6,7 +6,6 @@ import requests
 from datetime import datetime, timezone
 from datetime import datetime, timedelta
 
-
 # Cấu hình Telegram
 TELEGRAM_BOT_TOKEN = "7734494245:AAGgkR9F5zt-Ea5UvvYi5qkWnzE_FVSTRlY"
 TELEGRAM_CHAT_ID = "5898979798"
@@ -18,7 +17,7 @@ OFFSET_FILE = "/home/elk/telegram_debug.offset"
 
 # Cấu hình Elasticsearch
 ES_URL = "http://192.168.240.130:9200"
-ES_INDEX = "cisco-metrics-*"  
+ES_INDEX = "cisco-metrics-*"
 ES_QUERY_INTERVAL_SECONDS = 60  # query dữ liệu 60 giây gần nhất
 
 # Lưu thời điểm lần cuối lấy dữ liệu Elasticsearch
@@ -159,27 +158,72 @@ def process_elasticsearch_alerts():
         print("Không có cảnh báo mới từ Elasticsearch.")
         return
 
+    # Ngưỡng cảnh báo theo từng loại metric
+    thresholds = {
+        "cpu": 5,
+        "ram": 5,
+        "temperature": 5,
+        "port_status": "down"
+    }
+
     for alert in alerts:
         timestamp = alert.get("@timestamp", "No timestamp")
-        metric = alert.get("metric_type", "Unknown metric")
         device_ip = alert.get("device_ip", "Unknown device")
         device_model = alert.get("device_model", "Unknown model")
-        metric_type = alert.get("metric_type", "Unknown metric")
+        metric_type = alert.get("metric_type", "Unknown metric").lower()
         value = alert.get("value", "N/A")
 
-      
+        # Chuyển đổi metric_type thành tên hiển thị thân thiện hơn
+        metric_name_map = {
+            "cpu": "CPU Usage",
+            "ram": "RAM Usage",
+            "temperature": "Temperature",
+            "port_status": "Port Status"
+        }
+        metric_name = metric_name_map.get(metric_type, metric_type.capitalize())
+
+        # Định dạng giá trị value tùy theo loại metric
+        formatted_value = str(value)
+        if metric_type in ["cpu", "ram"]:
+            try:
+                formatted_value = f"{float(value):.1f}%"
+            except:
+                pass
+        elif metric_type == "temperature":
+            try:
+                formatted_value = f"{float(value):.1f}°C"
+            except:
+                pass
+        elif metric_type == "port_status":
+            formatted_value = str(value).capitalize()
+
+        # Xác định chi tiết cảnh báo dựa trên metric_type và value
+        status = ""
+        try:
+            if metric_type == "cpu" and float(value) > thresholds["cpu"]:
+                status = f"⚠️ CPU đang quá tải: {formatted_value} > {thresholds['cpu']}%"
+            elif metric_type == "ram" and float(value) > thresholds["ram"]:
+                status = f"⚠️ RAM sử dụng cao: {formatted_value} > {thresholds['ram']}%"
+            elif metric_type == "temperature" and float(value) > thresholds["temperature"]:
+                status = f"🔥 Nhiệt độ cao: {formatted_value} > {thresholds['temperature']}°C"
+            elif metric_type == "port_status" and str(value).lower() == thresholds["port_status"]:
+                port_name = alert.get("port_name", "Unknown port")
+                status = f"🔌 Cổng mạng '{port_name}' bị ngắt kết nối"
+            else:
+                status = f"{metric_name}: {formatted_value}"
+        except Exception as e:
+            status = f"{metric_name}: {formatted_value} (Không thể so sánh ngưỡng: {e})"
 
         message_text = (
-            f"<b>⚠️ Alert from Elasticsearch</b>\n"
-            f"<b>Timestamp:</b> {timestamp}\n"
-            f"<b>Device IP:</b> {device_ip}\n"
-            f"<b>Device_name:</b> {device_model}\n"
-            f"<b>Metric:</b> {metric_type}\n"
-            "<a href='http://192.168.240.130:5601'>🔍 Check Kibana</a>"
+            f"<b>⚠️ Cảnh báo hệ thống!</b>\n"
+            f"<b>⏱ Thời gian:</b> {timestamp}\n"
+            f"<b>📡 Thiết bị:</b> {device_model} ({device_ip})\n"
+            f"<b>📊 Loại chỉ số:</b> {metric_name}\n"
+            f"<b>🚨 Chi tiết cảnh báo:</b> {status}\n\n"
+            "<a href='http://192.168.240.130:5601'>🔍 Xem chi tiết trên Kibana</a>"
         )
         send_telegram_message(message_text)
         time.sleep(1)
-
 
 if __name__ == "__main__":
     while True:
